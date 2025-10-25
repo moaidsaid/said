@@ -1,0 +1,5 @@
+{
+  "name": "Copy of Gemini Multimedia Suite",
+  "description": "An advanced web application that leverages the Gemini API for powerful multimedia functionalities. Users can edit images with text prompts, generate stunning videos using Veo, and perform detailed video analysis with Gemini Pro.",
+  "requestFramePermissions": []
+}
