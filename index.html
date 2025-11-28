@@ -1,24 +1,376 @@
-
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Gemini Multimedia Suite</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-  <script type="importmap">
-{
-  "imports": {
-    "react/": "https://aistudiocdn.com/react@^19.2.0/",
-    "react": "https://aistudiocdn.com/react@^19.2.0",
-    "@google/genai": "https://aistudiocdn.com/@google/genai@^1.27.0",
-    "react-dom/": "https://aistudiocdn.com/react-dom@^19.2.0/"
-  }
-}
-</script>
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Ocean Guardian</title>
+  <style>
+    html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #021824; font-family: 'Inter', system-ui, -apple-system, sans-serif; color: #dff7ff; }
+    #ui { position: fixed; top: 0; left: 0; width: 100%; padding: 12px 16px; box-sizing: border-box; pointer-events: none; text-shadow: 0 0 8px rgba(0,0,0,0.7); }
+    #hud { display: flex; justify-content: space-between; align-items: center; gap: 12px; font-size: 14px; letter-spacing: 0.5px; }
+    #title { font-size: 18px; font-weight: 700; color: #7ae7ff; }
+    #crosshair { position: fixed; width: 32px; height: 32px; pointer-events: none; top: 50%; left: 50%; transform: translate(-50%, -50%); opacity: 0.8; }
+    #crosshair:before, #crosshair:after { content: ""; position: absolute; background: #7ae7ff; }
+    #crosshair:before { width: 20px; height: 2px; top: 15px; left: 6px; }
+    #crosshair:after { width: 2px; height: 20px; top: 6px; left: 15px; }
+    #help { position: fixed; bottom: 14px; left: 14px; padding: 12px 14px; background: rgba(0,0,0,0.35); border: 1px solid rgba(122,231,255,0.25); border-radius: 10px; color: #cfeefe; font-size: 12px; backdrop-filter: blur(6px); pointer-events: none; max-width: 320px; }
+    a { color: inherit; }
+  </style>
 </head>
-  <body class="bg-gray-900 text-white">
-    <div id="root"></div>
-    <script type="module" src="/index.tsx"></script>
-  </body>
+<body>
+  <div id="ui">
+    <div id="hud">
+      <div id="title">🦑 Ocean Guardian</div>
+      <div id="status">Speed 0 | Depth 0 | Health 100</div>
+    </div>
+  </div>
+  <div id="crosshair"></div>
+  <div id="help">
+    Mouse: steer the squid (physics-based banking)<br>
+    Left Click: fire ink toward the 3D crosshair<br>
+    Avoid debris, collect food for health, survive as speed rises.
+  </div>
+  <script type="module">
+    import * as THREE from 'https://unpkg.com/three@0.163.0/build/three.module.js';
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.8));
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    document.body.appendChild(renderer.domElement);
+
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 4000);
+    camera.position.set(0, 1.5, 8);
+
+    const clock = new THREE.Clock();
+
+    const player = {
+      mesh: null,
+      velocity: new THREE.Vector3(0, 0, 14),
+      target: new THREE.Vector3(),
+      health: 100,
+      time: 0
+    };
+
+    const obstacles = [];
+    const pickups = [];
+    const projectiles = [];
+    const floorChunks = [];
+
+    // Gradient sky shader
+    const skyGeo = new THREE.SphereGeometry(2000, 32, 16);
+    const skyMat = new THREE.ShaderMaterial({
+      side: THREE.BackSide,
+      uniforms: {
+        topColor: { value: new THREE.Color(0x0b3e59) },
+        middleColor: { value: new THREE.Color(0x116b8a) },
+        deepColor: { value: new THREE.Color(0x011621) },
+        cameraPos: { value: camera.position },
+        density: { value: 0.00035 }
+      },
+      vertexShader: `
+        varying vec3 vWorldPosition;
+        void main() {
+          vec4 wp = modelMatrix * vec4(position, 1.0);
+          vWorldPosition = wp.xyz;
+          gl_Position = projectionMatrix * viewMatrix * wp;
+        }
+      `,
+      fragmentShader: `
+        uniform vec3 topColor;
+        uniform vec3 middleColor;
+        uniform vec3 deepColor;
+        uniform vec3 cameraPos;
+        uniform float density;
+        varying vec3 vWorldPosition;
+        void main() {
+          float h = clamp((vWorldPosition.y + 200.0) / 400.0, 0.0, 1.0);
+          float depth = length(vWorldPosition - cameraPos);
+          float fog = 1.0 - exp(-depth * density);
+          vec3 grad = mix(deepColor, mix(middleColor, topColor, h), pow(h, 0.65));
+          vec3 color = mix(grad, topColor, fog * 0.15);
+          gl_FragColor = vec4(color, 1.0);
+        }
+      `
+    });
+    const sky = new THREE.Mesh(skyGeo, skyMat);
+    scene.add(sky);
+
+    // Lighting
+    const ambient = new THREE.AmbientLight(0x4fb7ff, 0.45);
+    scene.add(ambient);
+    const spot = new THREE.SpotLight(0x8ad5ff, 1.1, 0, Math.PI / 5, 0.5, 1.2);
+    spot.position.set(0, 18, 8);
+    spot.target.position.set(0, 0, -10);
+    scene.add(spot, spot.target);
+
+    // Volumetric-like light shafts
+    const beamGeo = new THREE.ConeGeometry(3.2, 18, 12, 1, true);
+    const beamMat = new THREE.MeshBasicMaterial({ color: 0x5cd4ff, transparent: true, opacity: 0.12, side: THREE.DoubleSide, depthWrite: false });
+    for (let i = 0; i < 4; i++) {
+      const beam = new THREE.Mesh(beamGeo, beamMat.clone());
+      beam.position.set((Math.random() - 0.5) * 18, 10 + Math.random() * 4, -8 - Math.random() * 10);
+      beam.rotation.x = Math.PI;
+      scene.add(beam);
+    }
+
+    // Sea particles
+    const particleGeo = new THREE.BufferGeometry();
+    const particleCount = 2000;
+    const positions = new Float32Array(particleCount * 3);
+    for (let i = 0; i < particleCount; i++) {
+      positions[i * 3] = (Math.random() - 0.5) * 40;
+      positions[i * 3 + 1] = Math.random() * 14 - 4;
+      positions[i * 3 + 2] = Math.random() * -200;
+    }
+    particleGeo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    const particleMat = new THREE.PointsMaterial({ color: 0xa7e9ff, size: 0.05, transparent: true, opacity: 0.65, depthWrite: false });
+    const particleSystem = new THREE.Points(particleGeo, particleMat);
+    scene.add(particleSystem);
+
+    // Squid body
+    function createSquid() {
+      const body = new THREE.Group();
+      const capsule = new THREE.Mesh(new THREE.CapsuleGeometry(0.6, 1.4, 12, 24), new THREE.MeshStandardMaterial({ color: 0x7ae7ff, emissive: 0x0d5f7a, emissiveIntensity: 0.9, roughness: 0.25, metalness: 0.15, transparent: true, opacity: 0.92 }));
+      capsule.rotation.x = Math.PI / 2;
+      body.add(capsule);
+
+      const headGlow = new THREE.Mesh(new THREE.SphereGeometry(0.6, 20, 16), new THREE.MeshBasicMaterial({ color: 0xb9f4ff, transparent: true, opacity: 0.35 }));
+      headGlow.position.z = 0.6;
+      body.add(headGlow);
+
+      const tentacles = [];
+      for (let i = 0; i < 8; i++) {
+        const group = new THREE.Group();
+        const segments = [];
+        let prev = new THREE.Vector3((Math.random() - 0.5) * 0.4, (Math.random() - 0.5) * 0.2 - 0.4, -0.4);
+        for (let s = 0; s < 12; s++) {
+          const sphere = new THREE.Mesh(new THREE.SphereGeometry(0.11 - s * 0.006, 10, 8), new THREE.MeshStandardMaterial({ color: 0x7ae7ff, emissive: 0x0d5f7a, roughness: 0.3, metalness: 0.1 }));
+          sphere.position.copy(prev);
+          group.add(sphere);
+          segments.push({ mesh: sphere, velocity: new THREE.Vector3(), target: prev.clone() });
+          prev = prev.clone().add(new THREE.Vector3((Math.random() - 0.5) * 0.06, -0.08 - Math.random() * 0.02, -0.12));
+        }
+        group.userData.segments = segments;
+        tentacles.push(group);
+        body.add(group);
+      }
+
+      scene.add(body);
+      player.mesh = body;
+      body.position.set(0, 0, 0);
+      return tentacles;
+    }
+
+    const tentacles = createSquid();
+
+    // Ground chunks
+    const chunkLength = 40;
+    function spawnChunk(z) {
+      const geo = new THREE.PlaneGeometry(40, chunkLength);
+      const mat = new THREE.MeshPhongMaterial({ color: 0x0b2f3d, side: THREE.DoubleSide, transparent: true, opacity: 0.75 });
+      const mesh = new THREE.Mesh(geo, mat);
+      mesh.rotation.x = -Math.PI / 2;
+      mesh.position.set(0, -2.5, z);
+      scene.add(mesh);
+      floorChunks.push(mesh);
+    }
+    for (let i = 0; i < 6; i++) spawnChunk(-i * chunkLength);
+
+    function spawnObstacle(z) {
+      const size = 0.6 + Math.random() * 1.6;
+      const geo = Math.random() > 0.5 ? new THREE.DodecahedronGeometry(size) : new THREE.BoxGeometry(size, size * (0.5 + Math.random()), size);
+      const mat = new THREE.MeshStandardMaterial({ color: 0x264b5a, emissive: 0x0d3241, roughness: 0.8 });
+      const mesh = new THREE.Mesh(geo, mat);
+      mesh.position.set((Math.random() - 0.5) * 12, -1 + Math.random() * 5, z);
+      scene.add(mesh);
+      obstacles.push(mesh);
+    }
+
+    function spawnPickup(z) {
+      const geo = new THREE.IcosahedronGeometry(0.35, 1);
+      const mat = new THREE.MeshStandardMaterial({ color: 0xfff6a3, emissive: 0xd8c35a, roughness: 0.35 });
+      const mesh = new THREE.Mesh(geo, mat);
+      mesh.position.set((Math.random() - 0.5) * 12, -1 + Math.random() * 5, z);
+      scene.add(mesh);
+      pickups.push(mesh);
+    }
+
+    for (let i = 0; i < 12; i++) spawnObstacle(-Math.random() * 120);
+    for (let i = 0; i < 5; i++) spawnPickup(-Math.random() * 120);
+
+    // Ink projectile
+    function fireInk() {
+      const dir = targetWorld.clone().sub(player.mesh.position).normalize();
+      const speed = 26 + player.velocity.length() * 0.2;
+      const geo = new THREE.SphereGeometry(0.14, 12, 10);
+      const mat = new THREE.MeshStandardMaterial({ color: 0x9ad9ff, emissive: 0x0f6f8f, roughness: 0.15 });
+      const mesh = new THREE.Mesh(geo, mat);
+      mesh.position.copy(player.mesh.position).add(new THREE.Vector3(0, 0, 0.4));
+      scene.add(mesh);
+      projectiles.push({ mesh, velocity: dir.multiplyScalar(speed).add(player.velocity.clone().multiplyScalar(0.25)), life: 6 });
+    }
+
+    const targetWorld = new THREE.Vector3(0, 0, -10);
+    const mouse = new THREE.Vector2();
+    const raycaster = new THREE.Raycaster();
+    window.addEventListener('mousemove', (e) => {
+      const x = (e.clientX / window.innerWidth) * 2 - 1;
+      const y = -(e.clientY / window.innerHeight) * 2 + 1;
+      mouse.set(x, y);
+    });
+    window.addEventListener('mousedown', (e) => {
+      if (e.button === 0) fireInk();
+    });
+
+    function updateTargetWorld() {
+      const planeZ = player.mesh.position.z - 8;
+      const plane = new THREE.Plane(new THREE.Vector3(0, 0, 1), -planeZ);
+      raycaster.setFromCamera(mouse, camera);
+      raycaster.ray.intersectPlane(plane, targetWorld);
+      if (!targetWorld) return;
+    }
+
+    function updateTentacles(dt) {
+      tentacles.forEach((group, idx) => {
+        const segments = group.userData.segments;
+        let anchor = new THREE.Vector3(Math.sin(idx * 0.8) * 0.4, -0.6 + Math.cos(idx) * 0.12, -0.6);
+        anchor.addScaledVector(player.velocity, -0.02);
+        const drag = 9 + idx * 0.2;
+        segments.forEach((seg, i) => {
+          const target = i === 0 ? anchor : segments[i - 1].mesh.position;
+          seg.target.lerp(target, 0.6);
+          const toTarget = seg.target.clone().sub(seg.mesh.position);
+          seg.velocity.addScaledVector(toTarget, dt * drag);
+          seg.velocity.addScaledVector(player.velocity, -dt * 0.45);
+          seg.velocity.multiplyScalar(0.86);
+          seg.mesh.position.addScaledVector(seg.velocity, dt);
+        });
+      });
+    }
+
+    function recycle() {
+      const playerZ = player.mesh.position.z;
+      floorChunks.forEach(chunk => {
+        if (chunk.position.z - playerZ > 60) {
+          chunk.position.z -= chunkLength * 6;
+        }
+      });
+      obstacles.forEach((o, idx) => {
+        if (o.position.z - playerZ > 40) {
+          o.position.z = playerZ - 120 - Math.random() * 80;
+          o.position.x = (Math.random() - 0.5) * 14;
+          o.position.y = -1 + Math.random() * 6;
+        }
+      });
+      pickups.forEach(p => {
+        if (p.position.z - playerZ > 40) {
+          p.position.z = playerZ - 80 - Math.random() * 120;
+          p.position.x = (Math.random() - 0.5) * 14;
+          p.position.y = -1 + Math.random() * 6;
+        }
+      });
+    }
+
+    function updateParticles(dt) {
+      const pos = particleGeo.getAttribute('position');
+      for (let i = 0; i < particleCount; i++) {
+        const z = pos.getZ(i) + player.velocity.z * dt * 0.45;
+        pos.setZ(i, z > 10 ? -200 : z);
+      }
+      pos.needsUpdate = true;
+    }
+
+    function handleCollisions() {
+      const playerPos = player.mesh.position;
+      obstacles.forEach(o => {
+        if (o.position.distanceTo(playerPos) < 1.1) {
+          player.health = Math.max(0, player.health - 15);
+          o.position.z = playerPos.z - 120 - Math.random() * 90;
+        }
+      });
+      pickups.forEach(p => {
+        if (p.position.distanceTo(playerPos) < 1.1) {
+          player.health = Math.min(120, player.health + 20);
+          p.position.z = playerPos.z - 100 - Math.random() * 120;
+        }
+      });
+    }
+
+    function updateProjectiles(dt) {
+      for (let i = projectiles.length - 1; i >= 0; i--) {
+        const proj = projectiles[i];
+        proj.life -= dt;
+        proj.mesh.position.addScaledVector(proj.velocity, dt);
+        proj.mesh.scale.multiplyScalar(0.999);
+        if (proj.life <= 0) {
+          scene.remove(proj.mesh);
+          projectiles.splice(i, 1);
+          continue;
+        }
+        obstacles.forEach((o, idx) => {
+          if (o.position.distanceTo(proj.mesh.position) < 0.8) {
+            scene.remove(o);
+            obstacles.splice(idx, 1);
+            spawnObstacle(player.mesh.position.z - 120 - Math.random() * 80);
+            scene.remove(proj.mesh);
+            projectiles.splice(i, 1);
+          }
+        });
+      }
+    }
+
+    function updateHUD() {
+      const status = document.getElementById('status');
+      status.textContent = `Speed ${player.velocity.z.toFixed(1)} | Depth ${player.mesh.position.y.toFixed(1)} | Health ${Math.round(player.health)}`;
+    }
+
+    function animate() {
+      const dt = Math.min(0.05, clock.getDelta());
+      player.time += dt;
+      updateTargetWorld();
+
+      // Progression
+      const speedBoost = Math.min(24, 8 + player.time * 0.5);
+      player.velocity.z = speedBoost;
+
+      // Steering physics
+      const desired = targetWorld.clone().sub(player.mesh.position);
+      desired.z = 0;
+      desired.clampLength(-4, 4);
+      player.target.lerp(desired, 0.12);
+      player.velocity.x += player.target.x * dt * 2.5;
+      player.velocity.y += player.target.y * dt * 2.2;
+      player.velocity.x *= 0.9;
+      player.velocity.y *= 0.9;
+
+      player.mesh.position.addScaledVector(player.velocity, dt);
+      player.mesh.rotation.y = Math.atan2(player.velocity.x, player.velocity.z);
+      player.mesh.rotation.x = Math.atan2(-player.velocity.y, player.velocity.z) * 0.6;
+      player.mesh.rotation.z = -player.velocity.x * 0.1;
+      sky.position.copy(camera.position);
+
+      camera.position.lerp(player.mesh.position.clone().add(new THREE.Vector3(0, 1.5, 8)), 0.08);
+      camera.lookAt(player.mesh.position.x, player.mesh.position.y, player.mesh.position.z - 8);
+
+      updateTentacles(dt);
+      recycle();
+      updateParticles(dt);
+      handleCollisions();
+      updateProjectiles(dt);
+
+      renderer.render(scene, camera);
+      updateHUD();
+      requestAnimationFrame(animate);
+    }
+
+    animate();
+
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+  </script>
+</body>
 </html>
